@@ -166,6 +166,7 @@ pub fn deserialize(comptime T: type, allocator: Allocator, serialized: []const u
         .array => |ary| if (@sizeOf(ary.child) == 1) {
             const r = try sizeAndDataOffset(serialized);
             if (r.offset + r.size > serialized.len) return error.RlpPayloadTooShort;
+            if (r.size != ary.len) return error.RlpInvalidLength;
             // this is a fixed-size array, so the destination has already been allocated.
             std.mem.copyForwards(u8, out.*[0..], serialized[r.offset .. r.offset + r.size]);
             return r.offset + r.size;
@@ -342,7 +343,7 @@ const Header = struct {
     transactions_root: [32]u8,
     receipts_root: [32]u8,
     logs_bloom: [256]u8,
-    prev_randao: [32]u8,
+    prev_randao: ?[32]u8,
     block_number: i64,
     gas_limit: i64,
     gas_used: u64,
@@ -421,4 +422,13 @@ test "deserialize a 55-byte string (0xb7 prefix)" {
     const consumed = try deserialize([]const u8, std.testing.allocator, &rlp_bytes, &out);
     try std.testing.expectEqual(56, consumed);
     try std.testing.expectEqualSlices(u8, &data, out);
+}
+
+test "deserialize [N]u8 from empty byte string must fail" {
+    // 0x80 is the RLP encoding of an empty byte string (zero length).
+    // Attempting to decode it into a [20]u8 must return an error, not
+    // silently produce 20 bytes of garbage/undefined.
+    const rlp_bytes = [_]u8{0x80};
+    var out: [20]u8 = undefined;
+    try std.testing.expectError(error.RlpInvalidLength, deserialize([20]u8, undefined, &rlp_bytes, &out));
 }
