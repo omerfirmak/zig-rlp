@@ -161,7 +161,7 @@ pub fn deserialize(comptime T: type, allocator: Allocator, serialized: []const u
                 return deserialize(ptr.child, allocator, serialized, out.*);
             },
             // TODO missing: Many, C
-            else => return error.UnSupportedType,
+            else => return error.UnsupportedType,
         },
         .array => |ary| if (@sizeOf(ary.child) == 1) {
             const r = try sizeAndDataOffset(serialized);
