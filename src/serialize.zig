@@ -25,25 +25,32 @@ pub fn serialize(comptime T: type, allocator: Allocator, data: T, list: *ArrayLi
     }
     const info = @typeInfo(T);
     return switch (info) {
-        .int => switch (data) {
-            0 => list.append(0x80),
-            1...127 => list.append(@truncate(data)),
+        .int => {
+            // RLP only supports unsigned integers. Signed types are not allowed.
+            comptime switch (@typeInfo(T).int.signedness) {
+                .unsigned => {},
+                .signed => @compileError("RLP does not support signed integers; use an unsigned type instead"),
+            };
+            return switch (data) {
+                0 => list.append(0x80),
+                1...127 => list.append(@truncate(data)),
 
-            else => {
-                // write integer to temp buffer so that it can
-                // be left-trimmed.
-                var int_buf: [@sizeOf(T)]u8 = undefined;
-                std.mem.writeInt(T, &int_buf, data, .big);
-                var tlist = ArrayList(u8).init(list.allocator);
-                defer tlist.deinit();
-                try tlist.appendSlice(&int_buf);
-                var start_offset: usize = 0; // note that only numbers up to 255 will work
-                while (tlist.items[start_offset] == 0) : (start_offset += 1) {}
+                else => {
+                    // write integer to temp buffer so that it can
+                    // be left-trimmed.
+                    var int_buf: [@sizeOf(T)]u8 = undefined;
+                    std.mem.writeInt(T, &int_buf, data, .big);
+                    var tlist = ArrayList(u8).init(list.allocator);
+                    defer tlist.deinit();
+                    try tlist.appendSlice(&int_buf);
+                    var start_offset: usize = 0;
+                    while (tlist.items[start_offset] == 0) : (start_offset += 1) {}
 
-                // copy final header + trimmed data
-                try list.append(@as(u8, @truncate(128 + tlist.items.len - start_offset)));
-                _ = try list.appendSlice(tlist.items[start_offset..]);
-            },
+                    // copy final header + trimmed data
+                    try list.append(@as(u8, @truncate(128 + tlist.items.len - start_offset)));
+                    _ = try list.appendSlice(tlist.items[start_offset..]);
+                },
+            };
         },
         .array => {
             // shortcut for byte lists
