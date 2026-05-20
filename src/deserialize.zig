@@ -158,6 +158,7 @@ pub fn deserialize(comptime T: type, allocator: Allocator, serialized: []const u
             },
             .one => {
                 out.* = try allocator.create(ptr.child);
+                errdefer allocator.destroy(out.*);
                 return deserialize(ptr.child, allocator, serialized, out.*);
             },
             // TODO missing: Many, C
