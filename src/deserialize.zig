@@ -132,7 +132,12 @@ pub fn deserialize(comptime T: type, allocator: Allocator, serialized: []const u
             .slice => if (ptr.child == u8) {
                 const r = try sizeAndDataOffset(serialized);
                 if (r.offset + r.size > serialized.len) return error.RlpPayloadTooShort;
-                out.* = serialized[r.offset .. r.offset + r.size];
+                if (ptr.is_const) {
+                    out.* = serialized[r.offset .. r.offset + r.size];
+                } else {
+                    out.* = try allocator.alloc(ptr.child, r.size);
+                    std.mem.copyForwards(ptr.child, out.*, serialized[r.offset .. r.offset + r.size]);
+                }
                 return r.offset + r.size;
             } else {
                 if (serialized[0] < rlpListShortHeader) {
