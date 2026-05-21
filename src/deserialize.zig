@@ -189,7 +189,7 @@ pub fn deserialize(comptime T: type, allocator: Allocator, serialized: []const u
             // will cause the container deserialization to
             // keep trying with the same offset, and that will
             // mark all optional values as empty.
-            if (serialized.len == 0 or serialized[0] == rlpByteListShortHeader or serialized[0] == rlpListLongHeader) {
+            if (serialized.len == 0 or serialized[0] == rlpByteListShortHeader or serialized[0] == rlpListShortHeader) {
                 out.* = null;
                 // 0 if serialized was empty, one in the case of an empty list
                 if (serialized.len == 0)
@@ -437,4 +437,82 @@ test "deserialize [N]u8 from empty byte string must fail" {
     const rlp_bytes = [_]u8{0x80};
     var out: [20]u8 = undefined;
     try std.testing.expectError(error.RlpInvalidLength, deserialize([20]u8, undefined, &rlp_bytes, &out));
+}
+
+test "short list header bound check (0xc0..0xf7)" {
+    // The short-list bound check in sizeAndDataOffset must use 0xc0
+    // (rlpListShortHeader) as the lower sentinel, not 0xf7.
+    // With the old buggy 0xf7 sentinel, headers in [0xc0, 0xf7) would be
+    // misclassified as long byte-strings (size_size = header - 0xb7)
+    // instead of short lists (size = header - 0xc0).
+    //
+    // 0xc5 = 0xc0 + 5 → short list with 5 bytes of payload.
+    // 0x84 = 0x80 + 4 → byte string of 4 bytes (encodes u32 = 0xdeadbeef).
+    // 0xde, 0xad, 0xbe, 0xef → the integer value.
+    const rlp = [_]u8{ 0xc5, 0x84, 0xde, 0xad, 0xbe, 0xef };
+    var out: []u32 = undefined;
+    const consumed = try deserialize([]u32, std.testing.allocator, &rlp, &out);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(consumed == rlp.len);
+    try std.testing.expectEqual(@as(usize, 1), out.len);
+    try std.testing.expectEqual(@as(u32, 0xdeadbeef), out[0]);
+}
+
+test "short list at lower bound 0xc0" {
+    // 0xc0 is the smallest valid short-list header (empty list).
+    // This exercises the very bottom of the [0xc0, 0xf7] range.
+    const rlp = [_]u8{0xc0};
+    var out: []u32 = undefined;
+    const consumed = try deserialize([]u32, std.testing.allocator, &rlp, &out);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(consumed == rlp.len);
+    try std.testing.expectEqual(@as(usize, 0), out.len);
+}
+
+test "short list at upper bound 0xf7" {
+    // 0xf7 is the largest valid short-list header (55 bytes of payload).
+    // This exercises the very top of the [0xc0, 0xf7] range.
+    var buf: [56]u8 = undefined;
+    buf[0] = 0xf7;
+    // 55 bytes of payload: 11 x u8 items (each 1 byte, all >= 0x80 so each
+    // is a single-byte RLP element).
+    for (buf[1..]) |*b| b.* = 0x81;
+    const rlp = buf[0..];
+    var out: []u8 = undefined;
+    const consumed = try deserialize([]u8, std.testing.allocator, rlp, &out);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(consumed == rlp.len);
+    try std.testing.expectEqual(@as(usize, 55), out.len);
+    for (out) |b| {
+        try std.testing.expectEqual(@as(u8, 0x81), b);
+    }
+}
+
+test "deserialize slice of non-byte types from short RLP list" {
+    // 0xc5 = 0xc0 + 5: short list header with 5 bytes of payload.
+    // 0x84 = 0x80 + 4: byte string of 4 bytes (encoding of u32 = 0xdeadbeef).
+    // 0xde, 0xad, 0xbe, 0xef: the value.
+    // This exercises the code path at the list-header guard for slices of
+    // non-byte types. The guard must use rlpListShortHeader (0xc0) as the
+    // lower bound; using 0xf7 would reject valid short list headers in [0xc0,
+    // 0xf7) as NotAnRLPList.
+    const rlp = [_]u8{ 0xc5, 0x84, 0xde, 0xad, 0xbe, 0xef };
+    var out: []u32 = undefined;
+    const consumed = try deserialize([]u32, std.testing.allocator, &rlp, &out);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(consumed == rlp.len);
+    try std.testing.expect(out.len == 1);
+    try std.testing.expect(out[0] == 0xdeadbeef);
+}
+
+test "deserialize empty slice of non-byte types from short RLP list" {
+    // 0xc0 is the RLP encoding of an empty list (short form).
+    // This exercises the lower bound of the list-header guard: the check
+    // must accept 0xc0 itself (using <=, not <).
+    const rlp = [_]u8{0xc0};
+    var out: []u32 = undefined;
+    const consumed = try deserialize([]u32, std.testing.allocator, &rlp, &out);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(consumed == rlp.len);
+    try std.testing.expect(out.len == 0);
 }
