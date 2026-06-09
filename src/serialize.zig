@@ -172,7 +172,7 @@ pub fn serialize(comptime T: type, allocator: Allocator, data: T, list: *ArrayLi
     };
 }
 
-const RawRLPValue = union(enum) {
+pub const RawRLPValue = union(enum) {
     value: []const u8,
     list: []const RawRLPValue,
 
