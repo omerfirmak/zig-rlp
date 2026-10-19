@@ -102,40 +102,21 @@ pub fn serialize(comptime T: type, allocator: Allocator, data: T, list: *ArrayLi
                 }
                 _ = try list.appendSlice(data[0..]);
             } else {
-                var tlist = ArrayList(u8).init(allocator);
-                defer tlist.deinit();
+                const start = try beginList(list);
+                errdefer list.shrinkRetainingCapacity(start);
                 for (data) |item| {
-                    try serialize(info.array.child, allocator, item, &tlist);
+                    try serialize(info.array.child, allocator, item, list);
                 }
-
-                if (tlist.items.len < 56) {
-                    try list.append(192 + @as(u8, @truncate(tlist.items.len)));
-                } else {
-                    const index = list.items.len;
-                    try list.append(0);
-                    const length = tlist.items.len;
-
-                    const length_length = try writeLengthLength(length, list);
-                    list.items[index] = 247 + length_length;
-                }
-                _ = try list.appendSlice(tlist.items);
+                try endList(list, start);
             }
         },
         .@"struct" => |sinfo| {
-            var tlist = ArrayList(u8).init(allocator);
-            defer tlist.deinit();
+            const start = try beginList(list);
+            errdefer list.shrinkRetainingCapacity(start);
             inline for (sinfo.field_names, sinfo.field_types) |field_name, field_type| {
-                try serialize(field_type, allocator, @field(data, field_name), &tlist);
+                try serialize(field_type, allocator, @field(data, field_name), list);
             }
-            if (tlist.items.len < 56) {
-                try list.append(192 + @as(u8, @truncate(tlist.items.len)));
-            } else {
-                const index = list.items.len;
-                try list.append(0);
-                const length_length = try writeLengthLength(tlist.items.len, list);
-                list.items[index] = 247 + length_length;
-            }
-            _ = try list.appendSlice(tlist.items);
+            try endList(list, start);
         },
         .pointer => |ptr| {
             switch (ptr.size) {
@@ -157,22 +138,12 @@ pub fn serialize(comptime T: type, allocator: Allocator, data: T, list: *ArrayLi
                         }
                         _ = try list.appendSlice(data);
                     } else {
-                        var tlist = ArrayList(u8).init(allocator);
-                        defer tlist.deinit();
+                        const start = try beginList(list);
+                        errdefer list.shrinkRetainingCapacity(start);
                         for (data) |item| {
-                            try serialize(ptr.child, allocator, item, &tlist);
+                            try serialize(ptr.child, allocator, item, list);
                         }
-
-                        if (tlist.items.len < 56) {
-                            try list.append(192 + @as(u8, @truncate(tlist.items.len)));
-                        } else {
-                            const index = list.items.len;
-                            try list.append(0);
-                            const length_length: u8 = try writeLengthLength(tlist.items.len, list);
-
-                            list.items[index] = 247 + length_length;
-                        }
-                        _ = try list.appendSlice(tlist.items);
+                        try endList(list, start);
                     }
                 },
                 .one => {
@@ -199,6 +170,43 @@ pub fn serialize(comptime T: type, allocator: Allocator, data: T, list: *ArrayLi
         },
         else => return error.UnsupportedType,
     };
+}
+
+// List headers depend on the payload length, which isn't known until the
+// payload is written. beginList reserves a one-byte placeholder in front of
+// the payload, and endList patches it once the payload is in place.
+fn beginList(list: *ArrayList(u8)) !usize {
+    const start = list.items.len;
+    try list.append(0);
+    return start;
+}
+
+fn endList(list: *ArrayList(u8), start: usize) !void {
+    const payload_len = list.items.len - start - 1;
+    if (payload_len <= rlpShortMaxLen) {
+        list.items[start] = rlpListShortHeader + @as(u8, @intCast(payload_len));
+        return;
+    }
+    // Long form: the length bytes go between the header byte and the
+    // payload, so shift the payload right to make room for them.
+    var enc_length_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &enc_length_buf, payload_len, .big);
+    const enc_length = std.mem.trimStart(u8, &enc_length_buf, &[_]u8{0});
+    try list.insertSlice(start + 1, enc_length);
+    list.items[start] = rlpListLongHeader + @as(u8, @intCast(enc_length.len));
+}
+
+/// Serializes `data` into `buf` without touching the heap, and returns the
+/// encoded prefix of `buf`. Fails with error.OutOfMemory if the encoding does
+/// not fit.
+pub fn serializeToSlice(comptime T: type, data: T, buf: []u8) SerializationError![]u8 {
+    var fba = std.heap.FixedBufferAllocator.init(buf);
+    // Claim the whole buffer up front: letting the list grow on demand would
+    // request rounded-up capacities that can overshoot `buf` even when the
+    // encoding itself fits.
+    var list = try ArrayList(u8).initCapacity(fba.allocator(), buf.len);
+    try serialize(T, fba.allocator(), data, &list);
+    return list.items;
 }
 
 pub const RawRLPValue = union(enum) {
@@ -440,6 +448,36 @@ test "access list filled" {
 
     testing.allocator.free(out.access_list[0].storage_keys);
     testing.allocator.free(out.access_list);
+}
+
+test "serialize into a fixed buffer" {
+    const Person = struct {
+        name: []const u8,
+        age: u8,
+    };
+    const person = Person{ .name = "Bob", .age = 0x2a };
+
+    var buf: [16]u8 = undefined;
+    const encoded = try serializeToSlice(Person, person, &buf);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xc5, 0x83, 'B', 'o', 'b', 0x2a }, encoded);
+    try testing.expectEqual(@as([*]u8, &buf), encoded.ptr);
+
+    // An exact fit must succeed.
+    var exact: [6]u8 = undefined;
+    try testing.expectEqualSlices(u8, encoded, try serializeToSlice(Person, person, &exact));
+
+    // A long list header grows the encoding in place and must still fit.
+    const long: [60]u8 = @splat(0xaa);
+    var long_buf: [64]u8 = undefined;
+    const long_encoded = try serializeToSlice([]const []const u8, &[_][]const u8{&long}, &long_buf);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xf8, 62, 0xb8, 60 }, long_encoded[0..4]);
+    try testing.expectEqual(@as(usize, 64), long_encoded.len);
+}
+
+test "serialize into a fixed buffer that is too small" {
+    var buf: [5]u8 = undefined;
+    try testing.expectError(error.OutOfMemory, serializeToSlice([]const u8, "hello", &buf));
+    try testing.expectError(error.OutOfMemory, serializeToSlice([]const u8, "hello", buf[0..0]));
 }
 
 test "one byte slice" {
