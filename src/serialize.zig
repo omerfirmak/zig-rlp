@@ -32,8 +32,15 @@ pub fn serialize(comptime T: type, allocator: Allocator, data: T, list: *ArrayLi
     return serializeImpl(T, allocator, data, list);
 }
 
+/// Like serialize, but without an allocator. Custom encoders of the
+/// `encodeToRLP(self, list)` form use this to serialize nested values; any
+/// type in `T` whose encoder takes an allocator is a compile error.
+pub fn serializeNoAlloc(comptime T: type, data: T, list: *ArrayList(u8)) SerializationError!void {
+    return serializeImpl(T, {}, data, list);
+}
+
 // `allocator` is either an Allocator, or void when the caller has none to
-// offer (serializeToSlice). Custom encoders may declare
+// offer (serializeNoAlloc). Custom encoders may declare
 // `encodeToRLP(self, list)` to opt out of needing one; one that does need an
 // allocator is a compile error when none is available.
 fn serializeImpl(comptime T: type, allocator: anytype, data: T, list: *ArrayList(u8)) SerializationError!void {
@@ -42,7 +49,7 @@ fn serializeImpl(comptime T: type, allocator: anytype, data: T, list: *ArrayList
             return data.encodeToRLP(list);
         }
         if (comptime @TypeOf(allocator) != Allocator) {
-            @compileError(@typeName(T) ++ ".encodeToRLP takes an allocator, which serializeToSlice cannot provide; use serialize, or drop the allocator parameter");
+            @compileError(@typeName(T) ++ ".encodeToRLP takes an allocator, but is being serialized without one (serializeNoAlloc or serializeToSlice); use serialize, or drop the allocator parameter");
         }
         return data.encodeToRLP(allocator, list);
     }
@@ -223,7 +230,7 @@ pub fn serializeToSlice(comptime T: type, data: T, buf: []u8) SerializationError
     // request rounded-up capacities that can overshoot `buf` even when the
     // encoding itself fits.
     var list = try ArrayList(u8).initCapacity(fba.allocator(), buf.len);
-    try serializeImpl(T, {}, data, &list);
+    try serializeNoAlloc(T, data, &list);
     return list.items;
 }
 
@@ -242,7 +249,7 @@ pub const RawRLPValue = union(enum) {
                 try list.appendSlice(v);
             },
             .list => |v| {
-                try serializeImpl([]const RawRLPValue, {}, v, list);
+                try serializeNoAlloc([]const RawRLPValue, v, list);
             },
         };
     }
@@ -502,6 +509,15 @@ const AllocatorFreeEncoder = struct {
     }
 };
 
+// Wraps its items in an extra list, serializing them through serializeNoAlloc.
+const AllocatorFreeWrapper = struct {
+    items: []const AllocatorFreeEncoder,
+
+    pub fn encodeToRLP(self: AllocatorFreeWrapper, list: *ArrayList(u8)) !void {
+        return serializeNoAlloc(struct { []const AllocatorFreeEncoder }, .{self.items}, list);
+    }
+};
+
 test "serialize into a fixed buffer with custom encoders" {
     var buf: [16]u8 = undefined;
     const encoded = try serializeToSlice([]const AllocatorFreeEncoder, &.{ .{ .x = 5 }, .{ .x = 6 } }, &buf);
@@ -509,6 +525,9 @@ test "serialize into a fixed buffer with custom encoders" {
 
     const raw = RawRLPValue{ .list = &.{ .{ .value = &.{0x01} }, .{ .value = &.{ 0x82, 0xab, 0xcd } } } };
     try testing.expectEqualSlices(u8, &[_]u8{ 0xc4, 0x01, 0x82, 0xab, 0xcd }, try serializeToSlice(RawRLPValue, raw, &buf));
+
+    const nested = AllocatorFreeWrapper{ .items = &.{ .{ .x = 1 }, .{ .x = 2 } } };
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xc3, 0xc2, 1, 2 }, try serializeToSlice(AllocatorFreeWrapper, nested, &buf));
 
     // The allocator-free form is also accepted by serialize.
     var list = ArrayList(u8).init(testing.allocator);
